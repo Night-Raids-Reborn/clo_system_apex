@@ -37,6 +37,7 @@
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/macros.h>
+#include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
@@ -51,6 +52,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/loop.h>
+#include <stdlib.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
@@ -76,6 +78,7 @@ using android::base::ErrnoError;
 using android::base::Error;
 using android::base::GetProperty;
 using android::base::Join;
+using android::base::ParseUint;
 using android::base::ReadFully;
 using android::base::Result;
 using android::base::StartsWith;
@@ -1171,6 +1174,11 @@ Result<void> ActivateApexPackages(const std::vector<ApexFile>& apexes) {
   return {};
 }
 
+bool ShouldActivateApexOnData(const ApexFile& apex) {
+  return HasPreInstalledVersion(apex.GetManifest().name()) &&
+         !apex.HasOnlyJsonManifest();
+}
+
 }  // namespace
 
 Result<void> scanPackagesDirAndActivate(const char* apex_package_dir) {
@@ -1350,6 +1358,36 @@ Result<void> destroyDeSnapshots(const int rollback_id) {
   return {};
 }
 
+/**
+ * Deletes all credential-encrypted snapshots for the given user, except for
+ * those listed in retain_rollback_ids.
+ */
+Result<void> destroyCeSnapshotsNotSpecified(
+    int user_id, const std::vector<int>& retain_rollback_ids) {
+  auto snapshot_root =
+      StringPrintf("%s/%d/%s", kCeDataDir, user_id, kApexSnapshotSubDir);
+  auto snapshot_dirs = GetSubdirs(snapshot_root);
+  if (!snapshot_dirs) {
+    return Error() << "Error reading snapshot dirs " << snapshot_dirs.error();
+  }
+
+  for (const auto& snapshot_dir : *snapshot_dirs) {
+    uint snapshot_id;
+    bool parse_ok = ParseUint(
+        std::filesystem::path(snapshot_dir).filename().c_str(), &snapshot_id);
+    if (parse_ok &&
+        std::find(retain_rollback_ids.begin(), retain_rollback_ids.end(),
+                  snapshot_id) == retain_rollback_ids.end()) {
+      Result<void> result = DeleteDir(snapshot_dir);
+      if (!result) {
+        return Error() << "Destroy CE snapshot failed for " << snapshot_dir
+                       << " : " << result.error();
+      }
+    }
+  }
+  return {};
+}
+
 void restorePreRestoreSnapshotsIfPresent(const std::string& base_dir,
                                          const ApexSession& session) {
   auto pre_restore_snapshot_path =
@@ -1416,8 +1454,21 @@ void scanStagedSessionsDirAndStage() {
   LOG(INFO) << "Scanning " << kApexSessionsDir
             << " looking for sessions to be activated.";
 
-  auto stagedSessions = ApexSession::GetSessionsInState(SessionState::STAGED);
-  for (auto& session : stagedSessions) {
+  auto sessionsToActivate =
+      ApexSession::GetSessionsInState(SessionState::STAGED);
+  if (gSupportsFsCheckpoints) {
+    // A session that is in the ACTIVATED state should still be re-activated if
+    // fs checkpointing is supported. In this case, a session may be in the
+    // ACTIVATED state yet the data/apex/active directory may have been
+    // reverted. The session should be reverted in this scenario.
+    auto activatedSessions =
+        ApexSession::GetSessionsInState(SessionState::ACTIVATED);
+    sessionsToActivate.insert(sessionsToActivate.end(),
+                              activatedSessions.begin(),
+                              activatedSessions.end());
+  }
+
+  for (auto& session : sessionsToActivate) {
     auto sessionId = session.GetId();
 
     auto session_failed_fn = [&]() {
@@ -1897,17 +1948,8 @@ void onStart(CheckpointInterface* checkpoint_service) {
     }
   } else {
     auto filter_fn = [](const ApexFile& apex) {
-      // Don't activate orphaned APEX packages that don't have a pre-installed
-      // version.
-      if (!HasPreInstalledVersion(apex.GetManifest().name())) {
-        LOG(WARNING) << "Skipping " << apex.GetPath()
-                     << " because there is no pre-installed version";
-        return false;
-      }
-      if (apex.HasOnlyJsonManifest()) {
-        LOG(WARNING) << "Skipping " << apex.GetPath()
-                     << " because it doesn't have apex_manifest.pb in the "
-                        ".apex container";
+      if (!ShouldActivateApexOnData(apex)) {
+        LOG(WARNING) << "Skipping " << apex.GetPath();
         return false;
       }
       return true;
@@ -2075,9 +2117,11 @@ Result<void> markStagedSessionSuccessful(const int session_id) {
   }
 }
 
+namespace {
+
 // Find dangling mounts and unmount them.
 // If one is on /data/apex/active, remove it.
-void unmountDanglingMounts() {
+void UnmountDanglingMounts() {
   std::multimap<std::string, MountedApexData> danglings;
   gMountedApexes.ForallMountedApexes([&](const std::string& package,
                                          const MountedApexData& data,
@@ -2103,6 +2147,36 @@ void unmountDanglingMounts() {
   }
 
   RemoveObsoleteHashTrees();
+}
+
+// Removes APEXes on /data that don't have corresponding pre-installed version.
+void RemoveOrphanedApexes() {
+  auto data_apexes = FindApexFilesByName(kActiveApexPackagesDataDir);
+  if (!data_apexes.ok()) {
+    LOG(ERROR) << "Failed to scan " << kActiveApexPackagesDataDir << " : "
+               << data_apexes.error();
+    return;
+  }
+  for (const auto& path : *data_apexes) {
+    auto apex = ApexFile::Open(path);
+    if (!apex.ok()) {
+      LOG(ERROR) << "Failed to open " << path << " : " << apex.error();
+      continue;
+    }
+    if (!ShouldActivateApexOnData(*apex)) {
+      LOG(DEBUG) << "Removing orphaned APEX " << path;
+      if (unlink(path.c_str()) != 0) {
+        PLOG(ERROR) << "Failed to unlink " << path;
+      }
+    }
+  }
+}
+
+}  // namespace
+
+void bootCompletedCleanup() {
+  UnmountDanglingMounts();
+  RemoveOrphanedApexes();
 }
 
 int unmountAll() {
