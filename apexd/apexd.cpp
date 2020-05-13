@@ -101,6 +101,7 @@ namespace {
 // These should be in-sync with system/sepolicy/public/property_contexts
 static constexpr const char* kApexStatusSysprop = "apexd.status";
 static constexpr const char* kApexStatusStarting = "starting";
+static constexpr const char* kApexStatusActivated = "activated";
 static constexpr const char* kApexStatusReady = "ready";
 
 static constexpr const char* kBuildFingerprintSysprop = "ro.build.fingerprint";
@@ -944,7 +945,6 @@ Result<void> activatePackageImpl(const ApexFile& apex_file) {
   const ApexManifest& manifest = apex_file.GetManifest();
 
   if (gBootstrap && !isBootstrapApex(apex_file)) {
-    LOG(INFO) << "Skipped when bootstrapping";
     return {};
   }
 
@@ -1607,7 +1607,7 @@ Result<void> stagePackages(const std::vector<std::string>& tmpPaths) {
 
   // Make sure that kActiveApexPackagesDataDir exists.
   auto create_dir_status =
-      createDirIfNeeded(std::string(kActiveApexPackagesDataDir), 0750);
+      createDirIfNeeded(std::string(kActiveApexPackagesDataDir), 0755);
   if (!create_dir_status.ok()) {
     return create_dir_status.error();
   }
@@ -1829,64 +1829,7 @@ Result<void> remountApexFile(const std::string& path) {
   return {};
 }
 
-Result<void> monitorBuiltinDirs() {
-  int fd = inotify_init1(IN_CLOEXEC);
-  if (fd == -1) {
-    return ErrnoErrorf("inotify_init failed");
-  }
-  std::map<int, std::string> desc_to_dir;
-  for (const auto& dir : kApexPackageBuiltinDirs) {
-    int desc = inotify_add_watch(fd, dir.c_str(), IN_CREATE | IN_MODIFY);
-    if (desc == -1 && errno != ENOENT) {
-      // don't complain about missing directories like /product/apex
-      return ErrnoErrorf("failed to add watch on {}", dir);
-    }
-    desc_to_dir.emplace(desc, dir);
-  }
-  std::thread th([fd, desc_to_dir]() -> void {
-    constexpr int num_events = 100;
-    constexpr size_t average_path_length = 50;
-    char buffer[num_events *
-                (sizeof(struct inotify_event) + average_path_length)];
-    while (true) {
-      ssize_t length = read(fd, buffer, sizeof(buffer));
-      if (length < 0) {
-        PLOG(ERROR) << "failed to read inotify event: " << strerror(errno);
-        continue;
-      }
-      int i = 0;
-      while (i < length) {
-        struct inotify_event* e = (struct inotify_event*)&buffer[i];
-        if (e->len > 0 && (e->mask & (IN_CREATE | IN_MODIFY)) != 0) {
-          if (desc_to_dir.find(e->wd) == desc_to_dir.end()) {
-            LOG(ERROR) << "unexpected watch descriptor " << e->wd
-                       << " for name: " << e->name;
-          } else {
-            std::string path = desc_to_dir.at(e->wd) + "/" + e->name;
-            auto ret = remountApexFile(path);
-            if (!ret.ok()) {
-              LOG(ERROR) << ret.error().message();
-            } else {
-              LOG(INFO) << path << " remounted because it was changed";
-            }
-          }
-        }
-        i += sizeof(struct inotify_event) + e->len;
-      }
-    }
-  });
-  th.detach();
-
-  return {};
-}
-
-void onStart(CheckpointInterface* checkpoint_service) {
-  LOG(INFO) << "Marking APEXd as starting";
-  if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusStarting)) {
-    PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
-                << kApexStatusStarting;
-  }
-
+void initialize(CheckpointInterface* checkpoint_service) {
   if (checkpoint_service != nullptr) {
     gVoldService = checkpoint_service;
     Result<bool> supports_fs_checkpoints =
@@ -1908,6 +1851,22 @@ void onStart(CheckpointInterface* checkpoint_service) {
     }
   }
 
+  Result<void> status = collectPreinstalledData(kApexPackageBuiltinDirs);
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to collect APEX keys : " << status.error();
+    return;
+  }
+
+  gMountedApexes.PopulateFromMounts();
+}
+
+void onStart() {
+  LOG(INFO) << "Marking APEXd as starting";
+  if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusStarting)) {
+    PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
+                << kApexStatusStarting;
+  }
+
   // Ask whether we should revert any active sessions; this can happen if
   // we've exceeded the retry count on a device that supports filesystem
   // checkpointing.
@@ -1924,18 +1883,10 @@ void onStart(CheckpointInterface* checkpoint_service) {
     }
   }
 
-  Result<void> status = collectPreinstalledData(kApexPackageBuiltinDirs);
-  if (!status.ok()) {
-    LOG(ERROR) << "Failed to collect APEX keys : " << status.error();
-    return;
-  }
-
-  gMountedApexes.PopulateFromMounts();
-
   // Activate APEXes from /data/apex. If one in the directory is newer than the
   // system one, the new one will eclipse the old one.
   scanStagedSessionsDirAndStage();
-  status = resumeRevertIfNeeded();
+  auto status = resumeRevertIfNeeded();
   if (!status.ok()) {
     LOG(ERROR) << "Failed to resume revert : " << status.error();
   }
@@ -1991,17 +1942,23 @@ void onStart(CheckpointInterface* checkpoint_service) {
 
   // Now that APEXes are mounted, snapshot or restore DE_sys data.
   snapshotOrRestoreDeSysData();
+}
 
-  if (android::base::GetBoolProperty("ro.debuggable", false)) {
-    status = monitorBuiltinDirs();
-    if (!status.ok()) {
-      LOG(ERROR) << "cannot monitor built-in dirs: " << status.error();
-    }
+void onAllPackagesActivated() {
+  // Set a system property to let other components know that APEXs are
+  // activated, but are not yet ready to be used. init is expected to wait
+  // for this status before performing configuration based on activated
+  // apexes. Other components that need to use APEXs should wait for the
+  // ready state instead.
+  LOG(INFO) << "Marking APEXd as activated";
+  if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusActivated)) {
+    PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
+                << kApexStatusActivated;
   }
 }
 
 void onAllPackagesReady() {
-  // Set a system property to let other components to know that APEXs are
+  // Set a system property to let other components know that APEXs are
   // correctly mounted and ready to be used. Before using any file from APEXs,
   // they can query this system property to ensure that they are okay to
   // access. Or they may have a on-property trigger to delay a task until
@@ -2204,6 +2161,11 @@ int unmountAll() {
     }
   });
   return ret;
+}
+
+bool isBooting() {
+  auto status = GetProperty(kApexStatusSysprop, "");
+  return status != kApexStatusReady && status != kApexStatusActivated;
 }
 
 }  // namespace apex
