@@ -908,14 +908,15 @@ Result<void> Unmount(const MountedApexData& data) {
   return android::apex::Unmount(data);
 }
 
-bool IsMounted(const std::string& name, const std::string& full_path) {
+bool IsMounted(const std::string& full_path) {
   bool found_mounted = false;
-  gMountedApexes.ForallMountedApexes(
-      name, [&](const MountedApexData& data, bool latest ATTRIBUTE_UNUSED) {
-        if (full_path == data.full_path) {
-          found_mounted = true;
-        }
-      });
+  gMountedApexes.ForallMountedApexes([&](const std::string&,
+                                         const MountedApexData& data,
+                                         [[maybe_unused]] bool latest) {
+    if (full_path == data.full_path) {
+      found_mounted = true;
+    }
+  });
   return found_mounted;
 }
 
@@ -1176,8 +1177,7 @@ Result<void> ActivateApexPackages(const std::vector<ApexFile>& apexes) {
 }
 
 bool ShouldActivateApexOnData(const ApexFile& apex) {
-  return HasPreInstalledVersion(apex.GetManifest().name()) &&
-         !apex.HasOnlyJsonManifest();
+  return HasPreInstalledVersion(apex.GetManifest().name());
 }
 
 }  // namespace
@@ -1217,6 +1217,7 @@ Result<void> snapshotDataDirectory(const std::string& base_dir,
 /**
  * Restores snapshot from base_dir/apexrollback/<rollback id>/<apex name>
  * to base_dir/apexdata/<apex name>.
+ * Note the snapshot will be deleted after restoration succeeded.
  */
 Result<void> restoreDataDirectory(const std::string& base_dir,
                                   const int rollback_id,
@@ -1227,11 +1228,19 @@ Result<void> restoreDataDirectory(const std::string& base_dir,
       pre_restore ? kPreRestoreSuffix : "", apex_name.c_str());
   auto to_path = StringPrintf("%s/%s/%s", base_dir.c_str(), kApexDataSubDir,
                               apex_name.c_str());
-  const Result<void> result = ReplaceFiles(from_path, to_path);
-  if (!result) {
+  Result<void> result = ReplaceFiles(from_path, to_path);
+  if (!result.ok()) {
     return result;
   }
-  return RestoreconPath(to_path);
+  result = RestoreconPath(to_path);
+  if (!result.ok()) {
+    return result;
+  }
+  result = DeleteDir(from_path);
+  if (!result.ok()) {
+    LOG(ERROR) << "Failed to delete the snapshot: " << result.error();
+  }
+  return {};
 }
 
 void snapshotOrRestoreDeIfNeeded(const std::string& base_dir,
@@ -1402,12 +1411,6 @@ void restorePreRestoreSnapshotsIfPresent(const std::string& base_dir,
         LOG(ERROR) << "Restore of pre-restore snapshot failed for " << apex_name
                    << ": " << result.error();
       }
-    }
-
-    Result<void> result = DeleteDir(pre_restore_snapshot_path);
-    if (!result) {
-      LOG(ERROR) << "Deletion of pre-restore snapshot failed: "
-                 << result.error();
     }
   }
 }
@@ -1827,7 +1830,7 @@ Result<void> remountApexFile(const std::string& path) {
   return activatePackage(path);
 }
 
-void initialize(CheckpointInterface* checkpoint_service) {
+void initializeVold(CheckpointInterface* checkpoint_service) {
   if (checkpoint_service != nullptr) {
     gVoldService = checkpoint_service;
     Result<bool> supports_fs_checkpoints =
@@ -1848,7 +1851,10 @@ void initialize(CheckpointInterface* checkpoint_service) {
       }
     }
   }
+}
 
+void initialize(CheckpointInterface* checkpoint_service) {
+  initializeVold(checkpoint_service);
   Result<void> status = collectPreinstalledData(kApexPackageBuiltinDirs);
   if (!status.ok()) {
     LOG(ERROR) << "Failed to collect APEX keys : " << status.error();
@@ -2105,7 +2111,8 @@ void UnmountDanglingMounts() {
   RemoveObsoleteHashTrees();
 }
 
-// Removes APEXes on /data that don't have corresponding pre-installed version.
+// Removes APEXes on /data that don't have corresponding pre-installed version
+// or that are corrupt
 void RemoveOrphanedApexes() {
   auto data_apexes = FindApexFilesByName(kActiveApexPackagesDataDir);
   if (!data_apexes.ok()) {
@@ -2116,7 +2123,15 @@ void RemoveOrphanedApexes() {
   for (const auto& path : *data_apexes) {
     auto apex = ApexFile::Open(path);
     if (!apex.ok()) {
-      LOG(ERROR) << "Failed to open " << path << " : " << apex.error();
+      LOG(DEBUG) << "Failed to open APEX " << path << " : " << apex.error();
+      // before removing, double-check if the path is active or not
+      // just in case ApexFile::Open() fails with valid APEX
+      if (!apexd_private::IsMounted(path)) {
+        LOG(DEBUG) << "Removing corrupt APEX " << path;
+        if (unlink(path.c_str()) != 0) {
+          PLOG(ERROR) << "Failed to unlink " << path;
+        }
+      }
       continue;
     }
     if (!ShouldActivateApexOnData(*apex)) {

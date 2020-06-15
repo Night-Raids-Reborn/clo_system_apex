@@ -86,6 +86,7 @@ using ::testing::Contains;
 using ::testing::EndsWith;
 using ::testing::HasSubstr;
 using ::testing::Not;
+using ::testing::SizeIs;
 using ::testing::UnorderedElementsAre;
 using ::testing::UnorderedElementsAreArray;
 
@@ -872,6 +873,9 @@ TEST_F(ApexServiceTest, RestoreCeData) {
       "/data/misc_ce/0/apexdata/apex.apexd_test/oldfile.txt"));
   ASSERT_FALSE(RegularFileExists(
       "/data/misc_ce/0/apexdata/apex.apexd_test/newfile.txt"));
+  // The snapshot should be deleted after restoration.
+  ASSERT_FALSE(
+      DirExists("/data/misc_ce/0/apexrollback/123456/apex.apexd_test"));
 }
 
 TEST_F(ApexServiceTest, DestroyDeSnapshots_DeSys) {
@@ -1401,7 +1405,7 @@ TEST_F(ApexServiceTest, NoPackagesAreBothActiveAndInactive) {
       activePackagesStrings.begin(), activePackagesStrings.end(),
       inactivePackagesStrings.begin(), inactivePackagesStrings.end(),
       std::back_inserter(intersection));
-  ASSERT_EQ(intersection.size(), 0UL);
+  ASSERT_THAT(intersection, SizeIs(0));
 }
 
 TEST_F(ApexServiceTest, GetAllPackages) {

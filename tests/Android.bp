@@ -149,18 +149,6 @@ java_test_host {
 }
 
 java_test_host {
-    name: "sdkextensions_e2e_tests",
-    srcs:  ["src/**/ApiExtensionsHostTest.java"],
-    libs: ["tradefed"],
-    static_libs: ["apex_e2e_base_test"],
-    data: [
-        ":test_com.android.sdkext",
-    ],
-    test_config: "sdkextensions-e2e-tests.xml",
-    test_suites: ["device-tests"],
-}
-
-java_test_host {
     name: "wifi_e2e_tests",
     srcs:  ["src/**/WifiHostTest.java"],
     defaults: ["apex_e2e_test_defaults"],
@@ -298,7 +286,10 @@ java_test_host {
     test_config: "apexd-host-tests.xml",
     test_suites: ["general-tests"],
     data: [
+        ":apex.apexd_test",
         ":apex.apexd_test_v2",
+        ":apex.apexd_test_v2_no_pb",
+        ":apex.apexd_test_v3",
         ":com.android.apex.cts.shim.v2_prebuilt",
         ":com.android.apex.cts.shim.v2_no_pb",
     ],
