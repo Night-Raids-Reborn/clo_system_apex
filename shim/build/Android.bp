@@ -57,7 +57,7 @@ apex {
   prebuilts: ["hash_of_dev_null"],
   apps: ["CtsShim", "CtsShimPriv"],
   installable: false,
-  whitelisted_files: "default_shim_whitelist.txt",
+  allowed_files: "default_shim_allowed_list.txt",
 }
 
 apex {
@@ -69,7 +69,7 @@ apex {
   prebuilts: ["hash_of_dev_null"],
   apps: ["CtsShim", "CtsShimPriv"],
   installable: false,
-  whitelisted_files: "default_shim_whitelist.txt",
+  allowed_files: "default_shim_allowed_list.txt",
 }
 
 apex {
@@ -80,7 +80,7 @@ apex {
   key: "com.android.apex.cts.shim.key",
   prebuilts: ["hash_of_dev_null"],
   installable: false,
-  whitelisted_files: "default_shim_whitelist.txt",
+  allowed_files: "default_shim_allowed_list.txt",
 }
 
 apex {
@@ -92,7 +92,7 @@ apex {
   prebuilts: ["hash_of_dev_null"],
   apps: ["CtsShim", "CtsShimPriv"],
   installable: false,
-  whitelisted_files: "default_shim_whitelist.txt",
+  allowed_files: "default_shim_allowed_list.txt",
   test_only_no_hashtree: true,
 }
 
@@ -105,7 +105,7 @@ apex {
   prebuilts: ["hash_of_dev_null"],
   apps: ["CtsShim", "CtsShimPriv"],
   installable: false,
-  whitelisted_files: "default_shim_whitelist.txt",
+  allowed_files: "default_shim_allowed_list.txt",
   test_only_unsigned_payload: true,
 }
 
@@ -235,7 +235,21 @@ apex {
   key: "com.android.apex.cts.shim.key",
   prebuilts: ["hash_v1"],
   apps: ["CtsShim", "CtsShimPriv"],
-  whitelisted_files: "default_shim_whitelist.txt",
+  allowed_files: "default_shim_allowed_list.txt",
+}
+
+// This is to install the flattened version of com.android.apex.cts.shim.
+// Because com.android.apex.cts.shim is provided as prebuilt and the build system
+// doesn't support install "flattened" version from "prebult" yet, GSI, which should
+// have both "flatttened" and "unflattened" APEXes, is missing the flattened version
+// of com.android.apex.cts.shim.
+// TODO(b/159426728):  When the build system can install "flattened" from "prebuilts",
+// this can be removed.
+override_apex {
+  name: "com.android.apex.cts.shim.v1_with_prebuilts",
+  base: "com.android.apex.cts.shim.v1",
+  apps: ["CtsShimPrebuilt", "CtsShimPrivPrebuilt"],
+  allowed_files: "prebuilts_shim_allowed_list.txt",
 }
 
 genrule {
@@ -430,7 +444,7 @@ genrule {
 }
 
 // This one is only used in ApexdHostTest and not meant to be installed
-// and hence shouldn't be whitelisted in hash.txt of v1 shim APEX.
+// and hence shouldn't be allowed in hash.txt of v1 shim APEX.
 apex {
   name: "com.android.apex.cts.shim.v2_legacy",
   manifest: "manifest_v2.json",
